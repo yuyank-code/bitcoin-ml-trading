@@ -4,18 +4,18 @@ Research-first BTCUSDT machine-learning trading system built around Binance mark
 
 ## Data layers
 
-1. Binance spot OHLCV and market data
+1. Binance spot OHLCV and public market data
 2. Free Coin Metrics Community + Blockchain.com on-chain data
 3. Binance futures derivatives context
 4. Free FRED macro/global-market data
 5. Fear & Greed + modular crypto news sentiment
 6. Binance market breadth + optional normalized ETF/Trends CSV inputs
 
-## Reference research path
+## Authoritative research path
 
-The reference model-selection path is:
+Use this sequence for final research/model selection:
 
-```text
+```bash
 python trading_bot.py --mode data
 python derivatives_data.py
 python sentiment_data.py
@@ -25,29 +25,32 @@ python alternative_signals.py
 python unified_research.py
 python production_research.py
 python validation.py
+python live_readiness.py
 ```
 
-`unified_research.py` first creates causal technical features and then joins other sources with conservative one-day lags. `production_research.py` performs expanding-window walk-forward evaluation and feature-group ablation.
+`unified_research.py` creates causal technical features first, then joins other sources with conservative one-day lags. `production_research.py` is the authoritative leakage-safe model-selection/backtest path. `validation.py` checks probability quality and performance artifacts. `paper_trader.py` and `forward_monitor.py` provide paper-only forward evaluation.
 
-### Leakage policy
+## Leakage policy
 
 - No random train/test shuffling.
 - Features at timestamp `t` can only use information available by `t`.
 - External sources are conservatively lagged before joining.
 - Future returns/labels are evaluation targets only.
-- The final decision rule uses model probability, stop/target geometry, and estimated transaction costs; it does **not** inspect the realized future return.
+- The final decision rule uses model probability, stop/target geometry, and estimated transaction costs; it does **not** inspect realized future return.
 - Macro data that has later revisions should ultimately be evaluated with point-in-time ALFRED vintages for release-sensitive research.
 
-## Validation
+## Validation and stress testing
 
-`validation.py` reports probability quality, AUC/Brier/log-loss, trade statistics, equity metrics, and signal distributions for generated prediction files. The repository also contains regression tests covering OHLCV validation, feature causality, namespacing, and the probability/cost-based decision layer.
+The system evaluates Brier score, log loss, accuracy, AUC, CAGR, drawdown, Sharpe, Sortino, win rate, profit factor, expectancy, turnover/cost sensitivity, and signal distributions. Feature-group ablation compares technical-only against each information layer and the combined candidate set.
 
 ## Paper trading
 
-`paper_trader.py` is a local virtual portfolio only. It persists state, applies fees/slippage, and records paper trades. It does not contain exchange credentials and cannot place real orders.
+`paper_trader.py` is a local virtual portfolio only. It persists state, applies fees/slippage, and records virtual trades. `forward_monitor.py` repeatedly obtains the latest public Binance-derived signal and updates the virtual portfolio. Neither file has exchange credentials or live-order capability.
 
-Real-money execution is intentionally disabled. Binance's signed order APIs require authenticated credentials; the research project must first demonstrate stable forward paper performance and pass an independent execution/risk review.
+## Live execution status
 
-## Important research limitations
+**Disabled.** The project has no real-money execution path. `live_readiness.py` is a hard gate that remains false until sufficient forward paper evidence and independent execution/risk review exist. Binance authenticated order APIs require signed credentials; public market-data access is separate from trading authorization. Binance documents signed order-test/trading endpoints and separate market-data streams. 
 
-A model can have good historical statistics and still fail in live markets. The system therefore treats accuracy as insufficient and evaluates drawdown, Sharpe/Sortino, turnover, fees, slippage, regime performance, and sensitivity to higher transaction costs. Data availability also differs by source: some Binance derivatives statistics have only recent history, while macro series can contain revisions.
+## Important research limitation
+
+Historical performance is not evidence of guaranteed future profit. Data coverage differs by source, derivatives history is limited for several statistics, and macro/news publication timing can create subtle revision or availability bias. The system therefore prefers conservative lags and rejects live execution until forward validation is complete.

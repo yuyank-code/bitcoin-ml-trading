@@ -2,4 +2,4 @@ numpy>=1.26
 pandas>=2.2
 scikit-learn>=1.5
 matplotlib>=3.9
-yfinance>=0.2.40
+requests>=2.32

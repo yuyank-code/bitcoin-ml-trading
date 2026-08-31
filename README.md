@@ -1,6 +1,6 @@
 # Bitcoin ML Trading Research System
 
-Research-first BTCUSDT machine-learning trading system built around Binance market data.
+Research-first BTCUSDT machine-learning trading system built around Binance market data, with a free on-chain research layer.
 
 ## What is included
 
@@ -16,14 +16,23 @@ Research-first BTCUSDT machine-learning trading system built around Binance mark
 - Gradient boosting, Random Forest, and Logistic Regression baselines
 - Buy/sell probability output
 - Optional recent Binance futures funding/open-interest context for live signals
-- Backtest predictions, trades, equity curve and JSON performance report
-- Regression tests for data validation and look-ahead leakage
+- Free Coin Metrics Community API on-chain metrics
+- Free Blockchain.com Charts API network metrics
+- Point-in-time-safe one-day-lagged on-chain features
+- Separate on-chain enriched walk-forward research pipeline
+- Backtest predictions, trades, equity curve and JSON performance reports
 
-## Research principles
+## Task 2: free on-chain data
 
-The model is not treated as an oracle. A prediction only becomes a trade when the expected edge is large enough to clear estimated fees, slippage, and a configurable safety margin. This is motivated by recent BTC walk-forward research showing that transaction costs and the forecast-to-trade conversion can dominate raw model performance.
+No paid Glassnode subscription is required. `onchain_data.py` discovers metrics available through Coin Metrics' Community API and combines them with selected public Blockchain.com charts. Coin Metrics documents its Community HTTP API as requiring no API key for community endpoints and provides a community rate limit; Blockchain.com documents its Charts API as a public interface to chart/statistics data.
 
-The historical training model uses only spot-derived features so the long history is not silently truncated by Binance's limited recent derivatives-history endpoints. Funding and open interest are treated as additional real-time context rather than pretending that a decade of derivatives data exists.
+Run the on-chain research pipeline:
+
+```bash
+python onchain_research.py
+```
+
+The pipeline downloads daily BTC market data, fetches available free/community on-chain data, aligns it by UTC day, applies a full-day lag before model use, creates changes/z-scores, and evaluates the enriched features using expanding-window walk-forward training. This is intentionally separate from the main intraday model until the on-chain features prove useful out of sample.
 
 ## Setup
 
@@ -35,7 +44,7 @@ pip install -r requirements.txt
 
 ## Commands
 
-Download the historical dataset:
+Download the historical Binance dataset:
 
 ```bash
 python trading_bot.py --mode data
@@ -47,28 +56,21 @@ Run the walk-forward backtest:
 python trading_bot.py --mode backtest --interval 1h
 ```
 
-Try the other model baselines:
-
-```bash
-python trading_bot.py --mode backtest --model random_forest
-python trading_bot.py --mode backtest --model logistic
-```
-
 Generate a fresh real-time-style signal from the latest Binance candles:
 
 ```bash
 python trading_bot.py --mode signal --interval 1h
 ```
 
-Run tests:
+Run the free on-chain enriched research:
 
 ```bash
-pytest -q
+python onchain_research.py
 ```
 
 ## Outputs
 
-The `outputs/` directory contains the downloaded history, features, out-of-sample predictions, trades, equity curve, latest signal, configuration, and performance report.
+The `outputs/` directory contains market history, features, predictions, trades, equity curves, latest signals, and performance reports. Task 2 additionally creates `bitcoin_onchain_daily.csv`, `onchain_enriched_predictions.csv`, and `onchain_report.json`.
 
 ## Important limitation
 

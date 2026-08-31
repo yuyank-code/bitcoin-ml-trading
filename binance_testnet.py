@@ -1,8 +1,8 @@
 """Secure Binance Spot Testnet adapter.
 
-Credentials are read only from environment variables. This module defaults to
-DRY_RUN=true and refuses live endpoints unless BINANCE_TESTNET=true. It is
-intended for integration testing of the model, not real-money execution.
+Credentials are loaded from the local environment/.env file. The adapter is
+hard-locked to Binance Spot Testnet and defaults to dry-run. It never uses the
+live Binance endpoint.
 """
 from __future__ import annotations
 import hashlib
@@ -11,9 +11,11 @@ import os
 import time
 from urllib.parse import urlencode
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 TESTNET_BASE = "https://testnet.binance.vision"
-LIVE_BASE = "https://api.binance.com"
 
 class BinanceConfig:
     def __init__(self):
@@ -22,7 +24,7 @@ class BinanceConfig:
         self.testnet=os.getenv("BINANCE_TESTNET","true").lower() in {"1","true","yes"}
         self.dry_run=os.getenv("BINANCE_DRY_RUN","true").lower() in {"1","true","yes"}
         if not self.testnet:
-            raise RuntimeError("Live Binance is disabled by this adapter. Set BINANCE_TESTNET=true.")
+            raise RuntimeError("Safety lock: BINANCE_TESTNET must remain true.")
         self.base=TESTNET_BASE
 
 class BinanceTestnetClient:
@@ -36,32 +38,37 @@ class BinanceTestnetClient:
 
     def _signed(self,path,params=None,method="GET"):
         if not self.cfg.api_key or not self.cfg.api_secret:
-            raise RuntimeError("BINANCE_API_KEY and BINANCE_API_SECRET are required for authenticated Testnet calls")
+            raise RuntimeError("BINANCE_API_KEY and BINANCE_API_SECRET are required")
         p=dict(params or {}); p["timestamp"]=int(time.time()*1000); p["recvWindow"]=5000
         query=urlencode(p,doseq=True)
         p["signature"]=hmac.new(self.cfg.api_secret.encode(),query.encode(),hashlib.sha256).hexdigest()
-        url=self.cfg.base+path
-        r=self.session.request(method,url,params=p,timeout=self.timeout); r.raise_for_status(); return r.json()
+        r=self.session.request(method,self.cfg.base+path,params=p,timeout=self.timeout); r.raise_for_status(); return r.json()
 
     def ping(self): return self._public("/api/v3/ping")
     def server_time(self): return self._public("/api/v3/time")
     def account(self): return self._signed("/api/v3/account")
     def open_orders(self,symbol="BTCUSDT"): return self._signed("/api/v3/openOrders",{"symbol":symbol})
     def test_order(self,symbol,side,order_type="MARKET",quantity=None,quote_order_qty=None):
-        """Validate an order on Testnet without creating a real order."""
         p={"symbol":symbol,"side":side,"type":order_type}
         if quantity is not None: p["quantity"]=quantity
         if quote_order_qty is not None: p["quoteOrderQty"]=quote_order_qty
         return self._signed("/api/v3/order/test",p,"POST")
 
     def create_order(self,**params):
-        """Create a Testnet order only when DRY_RUN=false; never reaches live Binance."""
         if self.cfg.dry_run:
             return {"dry_run":True,"endpoint":"/api/v3/order","params":params}
         return self._signed("/api/v3/order",params,"POST")
 
 if __name__=="__main__":
     c=BinanceTestnetClient()
-    print(c.ping())
-    print(c.server_time())
+    print("PING:",c.ping())
+    print("SERVER_TIME:",c.server_time())
+    print("TESTNET:",c.cfg.testnet)
     print("DRY_RUN:",c.cfg.dry_run)
+    if c.cfg.api_key and c.cfg.api_secret:
+        account=c.account()
+        print("AUTHENTICATED: True")
+        print("CAN_TRADE:",account.get("canTrade"))
+        print("ACCOUNT_TYPE:",account.get("accountType"))
+    else:
+        print("AUTHENTICATED: False (credentials not loaded)")

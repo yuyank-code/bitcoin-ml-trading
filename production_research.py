@@ -1,8 +1,8 @@
 """Leakage-safe final research engine.
 
-This is the reference path for model selection. It deliberately does NOT use
-future_return as an entry feature or trading decision. Future returns are used
-only after the signal timestamp for evaluation.
+Reference path for model selection. Future labels are never available to the
+model before their label horizon has ended, and future returns are not used as
+entry features or trading decisions.
 """
 from __future__ import annotations
 import json
@@ -16,9 +16,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 ROOT=Path(__file__).resolve().parent; OUT=ROOT/"outputs"; OUT.mkdir(exist_ok=True)
+HORIZON_BARS=6
 TECH=["ret_1","ret_3","ret_6","ret_12","ret_24","ret_72","ret_168","vol_6","vol_24","vol_72","atr_pct","range_pct","body_pct","rsi14","macd","macd_signal","macd_hist","sma24_ratio","sma72_ratio","ema24_ratio","ema168_ratio","bb_pos","bb_width","volume_z","volume_ratio","trend_24_168","drawdown_168","drawdown_720"]
 GROUP_PREFIX={"onchain":("oc_","onchain_"),"derivatives":("oi_","funding_","global_","top_","taker_","basis_"),"macro":("macro_",),"sentiment":("fear_greed","news_","sentiment_"),"breadth":("breadth_","etf_","trends_","dominance_")}
-
 
 def features(df,groups):
     cols=[c for c in TECH if c in df]
@@ -27,24 +27,28 @@ def features(df,groups):
             if c not in cols and any(c.startswith(p) for p in GROUP_PREFIX[g]): cols.append(c)
     return cols
 
-
 def model(kind,seed=42):
     if kind=="logistic": return Pipeline([("imp",SimpleImputer(strategy="median")),("scale",StandardScaler()),("m",LogisticRegression(C=.5,max_iter=3000,random_state=seed))])
     if kind=="rf": return Pipeline([("imp",SimpleImputer(strategy="median")),("m",RandomForestClassifier(n_estimators=300,min_samples_leaf=12,max_features="sqrt",class_weight="balanced",n_jobs=-1,random_state=seed))])
     return Pipeline([("imp",SimpleImputer(strategy="median")),("m",HistGradientBoostingClassifier(max_iter=250,learning_rate=.04,max_leaf_nodes=15,min_samples_leaf=30,l2_regularization=1.,random_state=seed))])
 
+def walk_forward(d,cols,initial=24*180,step=24*7,seed=42,horizon_bars=HORIZON_BARS):
+    """Generate strictly OOS predictions with event-horizon purging.
 
-def walk_forward(d,cols,initial=24*180,step=24*7,seed=42):
+    A training row at t has a label using prices through t+horizon_bars.
+    Therefore rows whose label can overlap the first test timestamp are
+    removed from training before every fold.
+    """
     x=d.sort_values("Date").reset_index(drop=True).copy(); x["prob_up"]=np.nan; x["model_disagreement"]=np.nan
     for start in range(initial,len(x),step):
-        end=min(start+step,len(x)); tr=x.iloc[:start]; te=x.iloc[start:end]
-        if tr.label.nunique()<2: continue
+        end=min(start+step,len(x)); train_end=max(0,start-horizon_bars)
+        tr=x.iloc[:train_end]; te=x.iloc[start:end]
+        if len(tr)<initial or tr.label.nunique()<2: continue
         ps=[]
         for k in ("logistic","rf","hgb"):
             m=model(k,seed); m.fit(tr[cols],tr.label); ps.append(m.predict_proba(te[cols])[:,1])
         a=np.vstack(ps); x.loc[te.index,"prob_up"]=a.mean(0); x.loc[te.index,"model_disagreement"]=a.std(0)
     return x.dropna(subset=["prob_up"]).reset_index(drop=True)
-
 
 def signal_backtest(d,fee_bps=5.,slip_bps=2.,risk=.005,max_position=.25,prob=0.56,stop_atr=2.,target_atr=3.,initial_cash=100000.):
     cash=initial_cash; peak=cash; eq=[]; trades=[]; last_day=None; day_start=cash; halted=False
@@ -55,8 +59,6 @@ def signal_backtest(d,fee_bps=5.,slip_bps=2.,risk=.005,max_position=.25,prob=0.5
         if dd<=-.15 or (day_start-cash)/max(day_start,1)>=.03: halted=True
         p=float(r.prob_up); atr=float(r.atr_pct)
         entry=float(n.Open)*(1+slip_bps/10000); stop_dist=max(entry*atr*stop_atr,entry*.002); target_dist=entry*atr*target_atr
-        # Expected value is calculated from the model probability and known-at-signal
-        # stop/target distances. It never references the future realized return.
         expected_gross=p*target_dist-(1-p)*stop_dist
         roundtrip_cost=entry*2*(fee_bps+slip_bps)/10000
         if halted or p<prob or expected_gross<=roundtrip_cost+entry*.0015: eq.append((r.Date,cash)); continue
@@ -70,7 +72,6 @@ def signal_backtest(d,fee_bps=5.,slip_bps=2.,risk=.005,max_position=.25,prob=0.5
         eq.append((n.Date,cash))
     e=pd.DataFrame(eq,columns=["Date","capital"]).drop_duplicates("Date").sort_values("Date"); t=pd.DataFrame(trades); return e,t
 
-
 def metrics(e,t):
     if e.empty:return {"trades":0}
     ret=e.capital.iloc[-1]/e.capital.iloc[0]-1; peak=e.capital.cummax(); dd=e.capital/peak-1; days=max((e.Date.iloc[-1]-e.Date.iloc[0]).days,1); years=days/365.25
@@ -80,24 +81,21 @@ def metrics(e,t):
     gp=t.loc[t.net_pnl>0,"net_pnl"].sum() if wins else 0; gl=-t.loc[t.net_pnl<=0,"net_pnl"].sum() if losses else 0
     return {"start":float(e.capital.iloc[0]),"final":float(e.capital.iloc[-1]),"return_pct":float(ret*100),"cagr_pct":float(cagr*100),"max_drawdown_pct":float(dd.min()*100),"sharpe":float(daily.mean()/sd*np.sqrt(365.25)) if sd>0 else None,"sortino":float(daily.mean()/down*np.sqrt(365.25)) if down>0 else None,"trades":int(len(t)),"win_rate_pct":float(wins/len(t)*100) if len(t) else None,"profit_factor":float(gp/gl) if gl else None,"expectancy":float(t.net_pnl.mean()) if len(t) else None}
 
-
 def run(source=OUT/"unified_dataset.csv"):
     if not source.exists(): raise FileNotFoundError("Build outputs/unified_dataset.csv first")
     d=pd.read_csv(source,parse_dates=["Date"]).sort_values("Date").reset_index(drop=True)
-    d["future_return"]=d.Close.shift(-6)/d.Close-1; d["label"]=(d.future_return>0).astype(int)
+    d["future_return"]=d.Close.shift(-HORIZON_BARS)/d.Close-1; d["label"]=(d.future_return>0).astype(int)
     d=d.dropna(subset=["future_return"])
     experiments={"technical":[],"technical_onchain":["onchain"],"technical_derivatives":["derivatives"],"technical_macro":["macro"],"technical_sentiment":["sentiment"],"technical_breadth":["breadth"],"all_sources":list(GROUP_PREFIX)}
     report={}
     for name,groups in experiments.items():
-        cols=features(d,groups)
-        pred=walk_forward(d,cols)
+        cols=features(d,groups); pred=walk_forward(d,cols,horizon_bars=HORIZON_BARS)
         pred.to_csv(OUT/f"final_{name}_predictions.csv",index=False)
         if len(pred):
-            auc=None
-            y=pred.label.to_numpy(); p=pred.prob_up.to_numpy();
+            auc=None; y=pred.label.to_numpy(); p=pred.prob_up.to_numpy()
             if len(np.unique(y))==2:
                 order=np.argsort(p); rank=np.empty_like(order); rank[order]=np.arange(len(p))+1; pos=y==1; neg=~pos; auc=float((rank[pos].sum()-pos.sum()*(pos.sum()+1)/2)/(pos.sum()*neg.sum()))
-            report[name]={"features":cols,"rows":len(pred),"brier":float(np.mean((p-y)**2)),"accuracy":float(np.mean((p>=.5)==y)),"auc":auc,"trade_rate":float((p>=.56).mean())}
+            report[name]={"features":cols,"rows":len(pred),"brier":float(np.mean((p-y)**2)),"accuracy":float(np.mean((p>=.5)==y)),"auc":auc,"trade_rate":float((p>=.56).mean()),"purge_bars":HORIZON_BARS}
             eq,tr=signal_backtest(pred); report[name]["backtest"]=metrics(eq,tr); tr.to_csv(OUT/f"final_{name}_trades.csv",index=False); eq.to_csv(OUT/f"final_{name}_equity.csv",index=False)
     (OUT/"final_model_report.json").write_text(json.dumps(report,indent=2,default=str)); return report
 

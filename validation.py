@@ -45,12 +45,17 @@ def trade_metrics(trades: pd.DataFrame) -> dict:
     return {"trades":int(len(pnl)),"wins":int(len(wins)),"losses":int(len(losses)),"win_rate_pct":float(len(wins)/len(pnl)*100),"profit_factor":float(wins.sum()/-losses.sum()) if losses.sum()<0 else None,"expectancy":float(pnl.mean()),"median_trade":float(pnl.median()),"fees":float(pd.to_numeric(trades.get("fees",0),errors="coerce").sum()),"slippage":float(pd.to_numeric(trades.get("slippage_cost",0),errors="coerce").sum())}
 
 
-def stress_costs(pred: pd.DataFrame, backtest_fn, fee_bps: float, slippage_bps: float) -> pd.DataFrame:
+def stress_costs(pred: pd.DataFrame, backtest_fn, fee_bps: float, slippage_bps: float, **backtest_kwargs) -> pd.DataFrame:
+    """Run a deterministic cost grid against scalar-argument backtests.
+
+    The authoritative signal_backtest accepts fee_bps/slip_bps as scalars.
+    Keeping this adapter explicit prevents a stale config-object interface from
+    silently turning the cost-stress test into an exception-only report.
+    """
     rows=[]
     for mult in [0.5,1.0,1.5,2.0,3.0]:
-        cfg=type("StressConfig",(),{"fee_bps":fee_bps*mult,"slippage_bps":slippage_bps*mult})()
         try:
-            eq,tr=backtest_fn(pred,cfg)
+            eq,tr=backtest_fn(pred, fee_bps=fee_bps*mult, slip_bps=slippage_bps*mult, **backtest_kwargs)
             rows.append({"cost_multiplier":mult,**equity_metrics(eq.capital,eq.Date),**trade_metrics(tr)})
         except Exception as exc:
             rows.append({"cost_multiplier":mult,"error":str(exc)})
@@ -62,9 +67,12 @@ def validate_predictions(path: str | Path) -> dict:
     required={"Date","label","prob_up"}
     missing=required-set(d.columns)
     if missing: raise ValueError(f"Missing required columns: {sorted(missing)}")
-    d=d.sort_values("Date").drop_duplicates("Date").reset_index(drop=True)
-    # A prediction at time t may use only data <= t; the target is retained only for evaluation.
-    result={"file":str(p),"time_sorted":bool(d.Date.is_monotonic_increasing),"duplicate_dates":int(d.Date.duplicated().sum()),"classification":classification_metrics(d.label,d.prob_up)}
+    raw_duplicate_dates=int(d.Date.duplicated().sum())
+    d=d.sort_values("Date")
+    result={"file":str(p),"time_sorted_before_dedup":bool(d.Date.is_monotonic_increasing),"duplicate_dates":raw_duplicate_dates,"classification":classification_metrics(d.label,d.prob_up)}
+    if raw_duplicate_dates:
+        result["validation_error"]="duplicate_dates"
+    d=d.drop_duplicates("Date").reset_index(drop=True)
     if "capital_after" in d.columns: result["equity"] = equity_metrics(d.capital_after,d.Date)
     if "signal" in d.columns: result["signal_counts"] = d.signal.value_counts(dropna=False).to_dict()
     return result

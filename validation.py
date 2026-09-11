@@ -62,14 +62,23 @@ def validate_predictions(path: str | Path) -> dict:
     required={"Date","label","prob_up"}
     missing=required-set(d.columns)
     if missing: raise ValueError(f"Missing required columns: {sorted(missing)}")
+    time_sorted_before_dedup=bool(d.Date.is_monotonic_increasing)
     raw_duplicate_dates=int(d.Date.duplicated().sum())
     d=d.sort_values("Date")
-    result={"file":str(p),"time_sorted_before_dedup":bool(d.Date.is_monotonic_increasing),"duplicate_dates":raw_duplicate_dates}
+    result={"file":str(p),"time_sorted_before_dedup":time_sorted_before_dedup,"duplicate_dates":raw_duplicate_dates}
     # Duplicate predictions are a validation failure, not a recoverable input
     # defect. Never deduplicate and continue because doing so can hide a
     # generator bug and silently change the evaluated sample.
     if raw_duplicate_dates:
         result["validation_error"]="duplicate_dates"
+        result["validated"] = False
+        return result
+    if d["label"].isna().any() or d["prob_up"].isna().any():
+        result["validation_error"]="missing_label_or_probability"
+        result["validated"] = False
+        return result
+    if not np.isfinite(pd.to_numeric(d["prob_up"], errors="coerce")).all():
+        result["validation_error"]="non_finite_probability"
         result["validated"] = False
         return result
     result["validated"] = True

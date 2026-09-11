@@ -33,12 +33,7 @@ def model(kind,seed=42):
     return Pipeline([("imp",SimpleImputer(strategy="median")),("m",HistGradientBoostingClassifier(max_iter=250,learning_rate=.04,max_leaf_nodes=15,min_samples_leaf=30,l2_regularization=1.,random_state=seed))])
 
 def walk_forward(d,cols,initial=24*180,step=24*7,seed=42,horizon_bars=HORIZON_BARS):
-    """Generate strictly OOS predictions with event-horizon purging.
-
-    A training row at t has a label using prices through t+horizon_bars.
-    Therefore rows whose label can overlap the first test timestamp are
-    removed from training before every fold.
-    """
+    """Generate strictly OOS predictions with event-horizon purging."""
     x=d.sort_values("Date").reset_index(drop=True).copy(); x["prob_up"]=np.nan; x["model_disagreement"]=np.nan
     for start in range(initial,len(x),step):
         end=min(start+step,len(x)); train_end=max(0,start-horizon_bars)
@@ -58,17 +53,26 @@ def signal_backtest(d,fee_bps=5.,slip_bps=2.,risk=.005,max_position=.25,prob=0.5
         dd=cash/max(peak,1)-1
         if dd<=-.15 or (day_start-cash)/max(day_start,1)>=.03: halted=True
         p=float(r.prob_up); atr=float(r.atr_pct)
-        entry=float(n.Open)*(1+slip_bps/10000); stop_dist=max(entry*atr*stop_atr,entry*.002); target_dist=entry*atr*target_atr
+        open_mid=float(n.Open); entry=open_mid*(1+slip_bps/10000)
+        stop_dist=max(entry*atr*stop_atr,entry*.002); target_dist=entry*atr*target_atr
         expected_gross=p*target_dist-(1-p)*stop_dist
         roundtrip_cost=entry*2*(fee_bps+slip_bps)/10000
         if halted or p<prob or expected_gross<=roundtrip_cost+entry*.0015: eq.append((r.Date,cash)); continue
         qty=min(cash*risk/stop_dist,cash*max_position/entry)
         hi,lo=float(n.High),float(n.Low); stop=entry-stop_dist; target=entry+target_dist
-        if lo<=stop: exit_px=stop; reason="stop"
-        elif hi>=target: exit_px=target; reason="target"
-        else: exit_px=float(n.Close); reason="horizon"
-        exit_px*=1-slip_bps/10000; gross=qty*(exit_px-entry); fees=(qty*entry+qty*exit_px)*fee_bps/10000; net=gross-fees; cash+=net; peak=max(peak,cash)
-        trades.append({"signal_time":r.Date,"entry_time":n.Date,"prob_up":p,"expected_gross":expected_gross,"entry":entry,"stop":stop,"target":target,"exit":exit_px,"qty":qty,"gross_pnl":gross,"fees":fees,"net_pnl":net,"exit_reason":reason,"capital_after":cash})
+        if lo<=stop: exit_mid=stop; reason="stop"
+        elif hi>=target: exit_mid=target; reason="target"
+        else: exit_mid=float(n.Close); reason="horizon"
+        exit_px=exit_mid*(1-slip_bps/10000)
+        entry_slippage_cost=qty*(entry-open_mid)
+        exit_slippage_cost=qty*(exit_mid-exit_px)
+        slippage_cost=entry_slippage_cost+exit_slippage_cost
+        gross_no_slippage=qty*(exit_mid-open_mid)
+        gross=qty*(exit_px-entry)
+        fees=(qty*entry+qty*exit_px)*fee_bps/10000
+        net=gross_no_slippage-fees-slippage_cost
+        cash+=net; peak=max(peak,cash)
+        trades.append({"signal_time":r.Date,"entry_time":n.Date,"prob_up":p,"expected_gross":expected_gross,"entry_mid":open_mid,"entry":entry,"stop":stop,"target":target,"exit_mid":exit_mid,"exit":exit_px,"qty":qty,"gross_pnl_no_slippage":gross_no_slippage,"gross_pnl_after_slippage":gross,"entry_slippage_cost":entry_slippage_cost,"exit_slippage_cost":exit_slippage_cost,"slippage_cost":slippage_cost,"fees":fees,"net_pnl":net,"exit_reason":reason,"capital_after":cash})
         eq.append((n.Date,cash))
     e=pd.DataFrame(eq,columns=["Date","capital"]).drop_duplicates("Date").sort_values("Date"); t=pd.DataFrame(trades); return e,t
 
@@ -79,7 +83,7 @@ def metrics(e,t):
     daily=e.set_index("Date").capital.resample("1D").last().ffill().pct_change().dropna(); sd=daily.std(); down=daily[daily<0].std()
     wins=(t.net_pnl>0).sum() if len(t) else 0; losses=(t.net_pnl<=0).sum() if len(t) else 0
     gp=t.loc[t.net_pnl>0,"net_pnl"].sum() if wins else 0; gl=-t.loc[t.net_pnl<=0,"net_pnl"].sum() if losses else 0
-    return {"start":float(e.capital.iloc[0]),"final":float(e.capital.iloc[-1]),"return_pct":float(ret*100),"cagr_pct":float(cagr*100),"max_drawdown_pct":float(dd.min()*100),"sharpe":float(daily.mean()/sd*np.sqrt(365.25)) if sd>0 else None,"sortino":float(daily.mean()/down*np.sqrt(365.25)) if down>0 else None,"trades":int(len(t)),"win_rate_pct":float(wins/len(t)*100) if len(t) else None,"profit_factor":float(gp/gl) if gl else None,"expectancy":float(t.net_pnl.mean()) if len(t) else None}
+    return {"start":float(e.capital.iloc[0]),"final":float(e.capital.iloc[-1]),"return_pct":float(ret*100),"cagr_pct":float(cagr*100),"max_drawdown_pct":float(dd.min()*100),"sharpe":float(daily.mean()/sd*np.sqrt(365.25)) if sd>0 else None,"sortino":float(daily.mean()/down*np.sqrt(365.25)) if down>0 else None,"trades":int(len(t)),"win_rate_pct":float(wins/len(t)*100) if len(t) else None,"profit_factor":float(gp/gl) if gl else None,"expectancy":float(t.net_pnl.mean()) if len(t) else None,"fees":float(t.fees.sum()) if len(t) else 0.,"slippage_cost":float(t.slippage_cost.sum()) if len(t) else 0.}
 
 def run(source=OUT/"unified_dataset.csv"):
     if not source.exists(): raise FileNotFoundError("Build outputs/unified_dataset.csv first")

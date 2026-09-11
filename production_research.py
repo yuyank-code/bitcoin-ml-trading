@@ -17,6 +17,12 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT=Path(__file__).resolve().parent; OUT=ROOT/"outputs"; OUT.mkdir(exist_ok=True)
 HORIZON_BARS=6
+COST_GRID=(0.5,1.0,1.5,2.0,3.0)
+BASE_FEE_BPS=5.0
+BASE_SLIP_BPS=2.0
+BASE_PROB=0.56
+BASE_STOP_ATR=2.0
+BASE_TARGET_ATR=3.0
 TECH=["ret_1","ret_3","ret_6","ret_12","ret_24","ret_72","ret_168","vol_6","vol_24","vol_72","atr_pct","range_pct","body_pct","rsi14","macd","macd_signal","macd_hist","sma24_ratio","sma72_ratio","ema24_ratio","ema168_ratio","bb_pos","bb_width","volume_z","volume_ratio","trend_24_168","drawdown_168","drawdown_720"]
 GROUP_PREFIX={"onchain":("oc_","onchain_"),"derivatives":("oi_","funding_","global_","top_","taker_","basis_"),"macro":("macro_",),"sentiment":("fear_greed","news_","sentiment_"),"breadth":("breadth_","etf_","trends_","dominance_")}
 
@@ -45,7 +51,7 @@ def walk_forward(d,cols,initial=24*180,step=24*7,seed=42,horizon_bars=HORIZON_BA
         a=np.vstack(ps); x.loc[te.index,"prob_up"]=a.mean(0); x.loc[te.index,"model_disagreement"]=a.std(0)
     return x.dropna(subset=["prob_up"]).reset_index(drop=True)
 
-def signal_backtest(d,fee_bps=5.,slip_bps=2.,risk=.005,max_position=.25,prob=.56,stop_atr=2.,target_atr=3.,initial_cash=100000.):
+def signal_backtest(d,fee_bps=BASE_FEE_BPS,slip_bps=BASE_SLIP_BPS,risk=.005,max_position=.25,prob=BASE_PROB,stop_atr=BASE_STOP_ATR,target_atr=BASE_TARGET_ATR,initial_cash=100000.):
     cash=initial_cash; peak=cash; eq=[]; trades=[]; last_day=None; day_start=cash; halted=False
     for i in range(len(d)-1):
         r,n=d.iloc[i],d.iloc[i+1]
@@ -87,22 +93,33 @@ def metrics(e,t):
     ambiguous=int(t.ambiguous_intrabar.sum()) if len(t) and "ambiguous_intrabar" in t else 0
     return {"start":float(e.capital.iloc[0]),"final":float(e.capital.iloc[-1]),"return_pct":float(ret*100),"cagr_pct":float(cagr*100),"max_drawdown_pct":float(dd.min()*100),"sharpe":float(daily.mean()/sd*np.sqrt(365.25)) if sd>0 else None,"sortino":float(daily.mean()/down*np.sqrt(365.25)) if down>0 else None,"trades":int(len(t)),"win_rate_pct":float(wins/len(t)*100) if len(t) else None,"profit_factor":float(gp/gl) if gl else None,"expectancy":float(t.net_pnl.mean()) if len(t) else None,"fees":float(t.fees.sum()) if len(t) else 0.,"slippage_cost":float(t.slippage_cost.sum()) if len(t) else 0.,"ambiguous_intrabar_trades":ambiguous,"ambiguous_intrabar_fraction":float(ambiguous/len(t)) if len(t) else 0.0}
 
+def cost_stress(pred):
+    rows=[]
+    for mult in COST_GRID:
+        eq,tr=signal_backtest(pred,fee_bps=BASE_FEE_BPS*mult,slip_bps=BASE_SLIP_BPS*mult)
+        m=metrics(eq,tr); rows.append({"cost_multiplier":mult,"fee_bps":BASE_FEE_BPS*mult,"slip_bps":BASE_SLIP_BPS*mult,**m})
+    return rows
+
 def run(source=OUT/"unified_dataset.csv"):
     if not source.exists(): raise FileNotFoundError("Build outputs/unified_dataset.csv first")
     d=pd.read_csv(source,parse_dates=["Date"]).sort_values("Date").reset_index(drop=True)
     d["future_return"]=d.Close.shift(-HORIZON_BARS)/d.Close-1; d["label"]=(d.future_return>0).astype(int)
     d=d.dropna(subset=["future_return"])
     experiments={"technical":[],"technical_onchain":["onchain"],"technical_derivatives":["derivatives"],"technical_macro":["macro"],"technical_sentiment":["sentiment"],"technical_breadth":["breadth"],"all_sources":list(GROUP_PREFIX)}
-    report={}
+    report={}; registry=[]
     for name,groups in experiments.items():
         cols=features(d,groups); pred=walk_forward(d,cols,horizon_bars=HORIZON_BARS)
         pred.to_csv(OUT/f"final_{name}_predictions.csv",index=False)
+        row={"experiment_id":name,"feature_groups":groups,"model_ensemble":["logistic","rf","hgb"],"horizon_bars":HORIZON_BARS,"initial_train_bars":24*180,"step_bars":24*7,"purge_bars":HORIZON_BARS,"seed":42,"fee_bps":BASE_FEE_BPS,"slippage_bps":BASE_SLIP_BPS,"prob_threshold":BASE_PROB,"stop_atr":BASE_STOP_ATR,"target_atr":BASE_TARGET_ATR,"cost_grid_multipliers":list(COST_GRID)}
         if len(pred):
-            auc=None; y=pred.label.to_numpy(); p=pred.prob_up.to_numpy()
+            y=pred.label.to_numpy(); p=pred.prob_up.to_numpy(); auc=None
             if len(np.unique(y))==2:
                 order=np.argsort(p); rank=np.empty_like(order); rank[order]=np.arange(len(p))+1; pos=y==1; neg=~pos; auc=float((rank[pos].sum()-pos.sum()*(pos.sum()+1)/2)/(pos.sum()*neg.sum()))
-            report[name]={"features":cols,"rows":len(pred),"brier":float(np.mean((p-y)**2)),"accuracy":float(np.mean((p>=.5)==y)),"auc":auc,"trade_rate":float((p>=.56).mean()),"purge_bars":HORIZON_BARS}
-            eq,tr=signal_backtest(pred); report[name]["backtest"]=metrics(eq,tr); tr.to_csv(OUT/f"final_{name}_trades.csv",index=False); eq.to_csv(OUT/f"final_{name}_equity.csv",index=False)
-    (OUT/"final_model_report.json").write_text(json.dumps(report,indent=2,default=str)); return report
+            eq,tr=signal_backtest(pred); report[name]={"features":cols,"rows":len(pred),"brier":float(np.mean((p-y)**2)),"accuracy":float(np.mean((p>=.5)==y)),"auc":auc,"trade_rate":float((p>=BASE_PROB).mean()),"purge_bars":HORIZON_BARS,"backtest":metrics(eq,tr),"cost_stress":cost_stress(pred)}
+            tr.to_csv(OUT/f"final_{name}_trades.csv",index=False); eq.to_csv(OUT/f"final_{name}_equity.csv",index=False)
+            row.update({"prediction_rows":len(pred),"status":"completed"})
+        else: row.update({"prediction_rows":0,"status":"no_oos_predictions"})
+        registry.append(row)
+    (OUT/"final_model_report.json").write_text(json.dumps(report,indent=2,default=str)); (OUT/"final_trial_registry.json").write_text(json.dumps(registry,indent=2,default=str)); return report
 
 if __name__=="__main__": print(json.dumps(run(),indent=2,default=str))

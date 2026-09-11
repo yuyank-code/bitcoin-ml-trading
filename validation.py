@@ -46,12 +46,7 @@ def trade_metrics(trades: pd.DataFrame) -> dict:
 
 
 def stress_costs(pred: pd.DataFrame, backtest_fn, fee_bps: float, slippage_bps: float, **backtest_kwargs) -> pd.DataFrame:
-    """Run a deterministic cost grid against scalar-argument backtests.
-
-    The authoritative signal_backtest accepts fee_bps/slip_bps as scalars.
-    Keeping this adapter explicit prevents a stale config-object interface from
-    silently turning the cost-stress test into an exception-only report.
-    """
+    """Run a deterministic cost grid against scalar-argument backtests."""
     rows=[]
     for mult in [0.5,1.0,1.5,2.0,3.0]:
         try:
@@ -69,10 +64,16 @@ def validate_predictions(path: str | Path) -> dict:
     if missing: raise ValueError(f"Missing required columns: {sorted(missing)}")
     raw_duplicate_dates=int(d.Date.duplicated().sum())
     d=d.sort_values("Date")
-    result={"file":str(p),"time_sorted_before_dedup":bool(d.Date.is_monotonic_increasing),"duplicate_dates":raw_duplicate_dates,"classification":classification_metrics(d.label,d.prob_up)}
+    result={"file":str(p),"time_sorted_before_dedup":bool(d.Date.is_monotonic_increasing),"duplicate_dates":raw_duplicate_dates}
+    # Duplicate predictions are a validation failure, not a recoverable input
+    # defect. Never deduplicate and continue because doing so can hide a
+    # generator bug and silently change the evaluated sample.
     if raw_duplicate_dates:
         result["validation_error"]="duplicate_dates"
-    d=d.drop_duplicates("Date").reset_index(drop=True)
+        result["validated"] = False
+        return result
+    result["validated"] = True
+    result["classification"]=classification_metrics(d.label,d.prob_up)
     if "capital_after" in d.columns: result["equity"] = equity_metrics(d.capital_after,d.Date)
     if "signal" in d.columns: result["signal_counts"] = d.signal.value_counts(dropna=False).to_dict()
     return result

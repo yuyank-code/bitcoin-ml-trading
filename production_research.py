@@ -94,10 +94,33 @@ def metrics(e,t):
     return {"start":float(e.capital.iloc[0]),"final":float(e.capital.iloc[-1]),"return_pct":float(ret*100),"cagr_pct":float(cagr*100),"max_drawdown_pct":float(dd.min()*100),"sharpe":float(daily.mean()/sd*np.sqrt(365.25)) if sd>0 else None,"sortino":float(daily.mean()/down*np.sqrt(365.25)) if down>0 else None,"trades":int(len(t)),"win_rate_pct":float(wins/len(t)*100) if len(t) else None,"profit_factor":float(gp/gl) if gl else None,"expectancy":float(t.net_pnl.mean()) if len(t) else None,"fees":float(t.fees.sum()) if len(t) else 0.,"slippage_cost":float(t.slippage_cost.sum()) if len(t) else 0.,"ambiguous_intrabar_trades":ambiguous,"ambiguous_intrabar_fraction":float(ambiguous/len(t)) if len(t) else 0.0}
 
 def cost_stress(pred):
+    """Adaptive stress: costs are changed before trade eligibility, so trade count may change."""
     rows=[]
     for mult in COST_GRID:
         eq,tr=signal_backtest(pred,fee_bps=BASE_FEE_BPS*mult,slip_bps=BASE_SLIP_BPS*mult)
-        m=metrics(eq,tr); rows.append({"cost_multiplier":mult,"fee_bps":BASE_FEE_BPS*mult,"slip_bps":BASE_SLIP_BPS*mult,**m})
+        m=metrics(eq,tr); rows.append({"cost_multiplier":mult,"fee_bps":BASE_FEE_BPS*mult,"slip_bps":BASE_SLIP_BPS*mult,"policy":"adaptive_cost_aware",**m})
+    return rows
+
+def frozen_cost_stress(pred):
+    """Pure cost repricing: freeze the base-policy trade ledger before changing costs."""
+    _, base_trades = signal_backtest(pred, fee_bps=BASE_FEE_BPS, slip_bps=BASE_SLIP_BPS)
+    rows=[]
+    if base_trades.empty:
+        return [{"cost_multiplier":m,"fee_bps":BASE_FEE_BPS*m,"slip_bps":BASE_SLIP_BPS*m,"policy":"frozen_base_trade_ledger","trades":0} for m in COST_GRID]
+    for mult in COST_GRID:
+        fee_bps=BASE_FEE_BPS*mult; slip_bps=BASE_SLIP_BPS*mult
+        t=base_trades.copy()
+        t["entry_slippage_cost_frozen"]=t.qty*t.entry_mid*slip_bps/10000
+        t["exit_slippage_cost_frozen"]=t.qty*t.exit_mid*slip_bps/10000
+        t["slippage_cost_frozen"]=t.entry_slippage_cost_frozen+t.exit_slippage_cost_frozen
+        t["fees_frozen"]=(t.qty*t.entry_mid+t.qty*t.exit_mid)*fee_bps/10000
+        t["net_pnl_frozen"]=t.gross_pnl_no_slippage-t.slippage_cost_frozen-t.fees_frozen
+        capital=100000.0; eq_rows=[]
+        for _,tr in t.iterrows():
+            capital+=float(tr.net_pnl_frozen); eq_rows.append((pd.Timestamp(tr.entry_time),capital))
+        e=pd.DataFrame(eq_rows,columns=["Date","capital"])
+        m=metrics(e,t.assign(net_pnl=t.net_pnl_frozen,fees=t.fees_frozen,slippage_cost=t.slippage_cost_frozen))
+        rows.append({"cost_multiplier":mult,"fee_bps":fee_bps,"slip_bps":slip_bps,"policy":"frozen_base_trade_ledger",**m})
     return rows
 
 def run(source=OUT/"unified_dataset.csv"):
@@ -115,7 +138,7 @@ def run(source=OUT/"unified_dataset.csv"):
             y=pred.label.to_numpy(); p=pred.prob_up.to_numpy(); auc=None
             if len(np.unique(y))==2:
                 order=np.argsort(p); rank=np.empty_like(order); rank[order]=np.arange(len(p))+1; pos=y==1; neg=~pos; auc=float((rank[pos].sum()-pos.sum()*(pos.sum()+1)/2)/(pos.sum()*neg.sum()))
-            eq,tr=signal_backtest(pred); report[name]={"features":cols,"rows":len(pred),"brier":float(np.mean((p-y)**2)),"accuracy":float(np.mean((p>=.5)==y)),"auc":auc,"trade_rate":float((p>=BASE_PROB).mean()),"purge_bars":HORIZON_BARS,"backtest":metrics(eq,tr),"cost_stress":cost_stress(pred)}
+            eq,tr=signal_backtest(pred); report[name]={"features":cols,"rows":len(pred),"brier":float(np.mean((p-y)**2)),"accuracy":float(np.mean((p>=.5)==y)),"auc":auc,"trade_rate":float((p>=BASE_PROB).mean()),"purge_bars":HORIZON_BARS,"backtest":metrics(eq,tr),"cost_stress_adaptive":cost_stress(pred),"cost_stress_frozen":frozen_cost_stress(pred)}
             tr.to_csv(OUT/f"final_{name}_trades.csv",index=False); eq.to_csv(OUT/f"final_{name}_equity.csv",index=False)
             row.update({"prediction_rows":len(pred),"status":"completed"})
         else: row.update({"prediction_rows":0,"status":"no_oos_predictions"})

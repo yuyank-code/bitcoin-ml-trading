@@ -7,7 +7,6 @@ only retain recent observations.
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 import pandas as pd
@@ -91,6 +90,25 @@ def fetch_basis(pair="BTCUSDT", contract_type="PERPETUAL", period="1h", limit=50
     return d[["Date", "basisRate", "annualizedBasisRate", "basis", "futuresPrice", "indexPrice"]].rename(columns={"basisRate":"basis_rate","annualizedBasisRate":"annualized_basis_rate","basis":"basis_value","futuresPrice":"futures_price","indexPrice":"index_price"})
 
 
+def _causal_asof_merge(left: pd.DataFrame, right: pd.DataFrame, tolerance="2h") -> pd.DataFrame:
+    """Join only information observable at or before each left timestamp.
+
+    ``nearest`` is deliberately forbidden here because it can select a future
+    source observation and violate the event-time/no-look-ahead contract.
+    """
+    if left.empty or right.empty:
+        return left
+    l = left.sort_values("Date").copy()
+    r = right.sort_values("Date").copy()
+    return pd.merge_asof(
+        l,
+        r,
+        on="Date",
+        direction="backward",
+        tolerance=pd.Timedelta(tolerance),
+    )
+
+
 def collect_current(symbol="BTCUSDT"):
     """Collect the latest available public derivatives statistics."""
     frames = [
@@ -106,7 +124,7 @@ def collect_current(symbol="BTCUSDT"):
     for f in frames:
         if f.empty: continue
         f = f.sort_values("Date")
-        merged = f if merged is None else pd.merge_asof(merged, f, on="Date", direction="nearest", tolerance=pd.Timedelta("2h"))
+        merged = f if merged is None else _causal_asof_merge(merged, f, tolerance="2h")
     if merged is None: raise RuntimeError("No derivatives data returned")
     merged.to_csv(OUT / "binance_derivatives.csv", index=False)
     return merged

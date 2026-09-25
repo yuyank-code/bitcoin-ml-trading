@@ -110,7 +110,12 @@ def main() -> None:
     if features_path.exists():
         d = pd.read_csv(features_path, parse_dates=["Date"])
     elif raw_path.exists():
-        d = make_features(pd.read_csv(raw_path, parse_dates=["Date"]), cfg)
+        # Hard causal boundary: legacy target columns must not exist before the
+        # executable research label is constructed below.
+        d = make_features(pd.read_csv(raw_path, parse_dates=["Date"]), cfg, labeled=False)
+        forbidden = [c for c in d.columns if c.startswith("future_") or c in {"future_return", "label"}]
+        if forbidden:
+            raise AssertionError(f"Future-derived columns present before labeling: {forbidden}")
     else:
         raise FileNotFoundError("No local BTC feature/history file available")
     d["Date"] = pd.to_datetime(d["Date"], utc=True)

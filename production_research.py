@@ -52,35 +52,60 @@ def walk_forward(d,cols,initial=24*180,step=24*7,seed=42,horizon_bars=HORIZON_BA
     return x.dropna(subset=["prob_up"]).reset_index(drop=True)
 
 def signal_backtest(d,fee_bps=BASE_FEE_BPS,slip_bps=BASE_SLIP_BPS,risk=.005,max_position=.25,prob=BASE_PROB,stop_atr=BASE_STOP_ATR,target_atr=BASE_TARGET_ATR,initial_cash=100000.):
+    """Sequential event-time execution with no future-label inputs.
+
+    Signal is formed at t, entry is Open[t+1], and the position is managed
+    through t+HORIZON_BARS. A new signal is not considered until the current
+    position is closed. If stop and target are both touched in one OHLC bar,
+    the conservative stop-first rule is used.
+    """
     cash=initial_cash; peak=cash; eq=[]; trades=[]; last_day=None; day_start=cash; halted=False
-    for i in range(len(d)-1):
-        r,n=d.iloc[i],d.iloc[i+1]
+    i=0
+    while i < len(d)-1:
+        r=d.iloc[i]
         if r.Date.date()!=last_day: last_day=r.Date.date(); day_start=cash; halted=False
         dd=cash/max(peak,1)-1
         if dd<=-.15 or (day_start-cash)/max(day_start,1)>=.03: halted=True
         p=float(r.prob_up); atr=float(r.atr_pct)
-        open_mid=float(n.Open); entry=open_mid*(1+slip_bps/10000)
-        stop_dist=max(entry*atr*stop_atr,entry*.002); target_dist=entry*atr*target_atr
+        entry_idx=i+1
+        entry_row=d.iloc[entry_idx]
+        open_mid=float(entry_row.Open)
+        entry=open_mid*(1+slip_bps/10000)
+        stop_dist=max(entry*atr*stop_atr,entry*.002)
+        target_dist=entry*atr*target_atr
         expected_gross=p*target_dist-(1-p)*stop_dist
         roundtrip_cost=entry*2*(fee_bps+slip_bps)/10000
-        if halted or p<prob or expected_gross<=roundtrip_cost+entry*.0015: eq.append((r.Date,cash)); continue
+        if halted or p<prob or expected_gross<=roundtrip_cost+entry*.0015:
+            eq.append((r.Date,cash)); i+=1; continue
         qty=min(cash*risk/stop_dist,cash*max_position/entry)
-        hi,lo=float(n.High),float(n.Low); stop=entry-stop_dist; target=entry+target_dist
-        ambiguous_intrabar=bool(lo<=stop and hi>=target)
-        if lo<=stop: exit_mid=stop; reason="stop"
-        elif hi>=target: exit_mid=target; reason="target"
-        else: exit_mid=float(n.Close); reason="horizon"
-        exit_px=exit_mid*(1-slip_bps/10000)
+        if qty<=0: i+=1; continue
+        stop=entry-stop_dist; target=entry+target_dist
+        exit_idx=min(entry_idx+HORIZON_BARS-1,len(d)-1)
+        exit_raw=float(d.iloc[exit_idx].Close); reason="horizon"; actual_exit=exit_idx
+        ambiguous=False
+        for j in range(entry_idx,exit_idx+1):
+            bar=d.iloc[j]; hi=float(bar.High); lo=float(bar.Low)
+            hit_stop=lo<=stop; hit_target=hi>=target
+            if hit_stop or hit_target:
+                ambiguous=hit_stop and hit_target
+                if hit_stop:
+                    exit_raw=stop; reason="stop"
+                else:
+                    exit_raw=target; reason="target"
+                actual_exit=j
+                break
+        exit_px=exit_raw*(1-slip_bps/10000)
         entry_slippage_cost=qty*(entry-open_mid)
-        exit_slippage_cost=qty*(exit_mid-exit_px)
+        exit_slippage_cost=qty*(exit_raw-exit_px)
         slippage_cost=entry_slippage_cost+exit_slippage_cost
-        gross_no_slippage=qty*(exit_mid-open_mid)
+        gross_no_slippage=qty*(exit_raw-open_mid)
         gross=qty*(exit_px-entry)
         fees=(qty*entry+qty*exit_px)*fee_bps/10000
         net=gross_no_slippage-fees-slippage_cost
         cash+=net; peak=max(peak,cash)
-        trades.append({"signal_time":r.Date,"entry_time":n.Date,"prob_up":p,"expected_gross":expected_gross,"entry_mid":open_mid,"entry":entry,"stop":stop,"target":target,"exit_mid":exit_mid,"exit":exit_px,"qty":qty,"gross_pnl_no_slippage":gross_no_slippage,"gross_pnl_after_slippage":gross,"entry_slippage_cost":entry_slippage_cost,"exit_slippage_cost":exit_slippage_cost,"slippage_cost":slippage_cost,"fees":fees,"net_pnl":net,"exit_reason":reason,"ambiguous_intrabar":ambiguous_intrabar,"capital_after":cash})
-        eq.append((n.Date,cash))
+        trades.append({"signal_time":r.Date,"entry_time":entry_row.Date,"prob_up":p,"expected_gross":expected_gross,"entry_mid":open_mid,"entry":entry,"stop":stop,"target":target,"exit_mid":exit_raw,"exit":exit_px,"qty":qty,"gross_pnl_no_slippage":gross_no_slippage,"gross_pnl_after_slippage":gross,"entry_slippage_cost":entry_slippage_cost,"exit_slippage_cost":exit_slippage_cost,"slippage_cost":slippage_cost,"fees":fees,"net_pnl":net,"exit_reason":reason,"ambiguous_intrabar":ambiguous,"capital_after":cash})
+        eq.append((d.iloc[actual_exit].Date,cash))
+        i=actual_exit+1
     e=pd.DataFrame(eq,columns=["Date","capital"]).drop_duplicates("Date").sort_values("Date"); t=pd.DataFrame(trades); return e,t
 
 def metrics(e,t):

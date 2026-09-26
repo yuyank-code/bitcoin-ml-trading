@@ -16,17 +16,29 @@ def _load(path:Path)->pd.DataFrame:
     if not path.exists(): return pd.DataFrame()
     d=pd.read_csv(path)
     if "Date" not in d: return pd.DataFrame()
-    d["Date"]=pd.to_datetime(d.Date,utc=True,errors="coerce"); return d.dropna(subset=["Date"]).sort_values("Date").drop_duplicates("Date",keep="last")
+    d["Date"]=pd.to_datetime(d.Date,utc=True,errors="coerce")
+    return d.dropna(subset=["Date"]).sort_values("Date").drop_duplicates("Date",keep="last")
 
 def _prefix(d:pd.DataFrame,source:str)->pd.DataFrame:
     return d.rename(columns={c:f"{source}_{c}" for c in d.columns if c!="Date"})
+
+def _assert_unlabeled(d:pd.DataFrame)->None:
+    forbidden={"label","future_return"}
+    forbidden.update(c for c in d.columns if c.startswith("future_"))
+    leaked=sorted(forbidden.intersection(d.columns))
+    if leaked:
+        raise AssertionError(f"Future-derived columns present before target construction: {leaked}")
 
 def build()->pd.DataFrame:
     raw=_load(OUT/"binance_btcusdt_history.csv")
     if raw.empty: raise FileNotFoundError("Run trading_bot.py --mode data first")
     raw=raw[[c for c in ["Date","Open","High","Low","Close","Volume"] if c in raw]]
     cfg=Config(interval="1h",horizon_bars=6)
-    result=make_features(raw,cfg).sort_values("Date").reset_index(drop=True)
+
+    # Critical causal boundary: feature construction must not materialize labels.
+    result=make_features(raw,cfg,labeled=False).sort_values("Date").reset_index(drop=True)
+    _assert_unlabeled(result)
+
     sources=[
         ("onchain",[OUT/"bitcoin_onchain_daily.csv"]),
         ("derivatives",[OUT/"derivatives_features.csv",OUT/"binance_derivatives.csv"]),
@@ -42,6 +54,8 @@ def build()->pd.DataFrame:
         # conservative for research and avoids assuming an exact publication time.
         src["Date"]=src.Date+pd.Timedelta(days=1)
         result=pd.merge_asof(result.sort_values("Date"),src,on="Date",direction="backward")
+        _assert_unlabeled(result)
+
     result.to_csv(OUT/"unified_dataset.csv",index=False)
     return result
 

@@ -25,6 +25,34 @@ OUT = ROOT / "outputs"
 OUT.mkdir(exist_ok=True)
 
 
+def validate_raw_ohlcv(d: pd.DataFrame, cfg: Config) -> None:
+    """Fail closed on the untouched market event stream before any transforms."""
+    required = {"Date", "Open", "High", "Low", "Close", "Volume"}
+    missing = required - set(d.columns)
+    if missing:
+        raise AssertionError(f"raw data missing columns: {sorted(missing)}")
+    x = d.copy()
+    x["Date"] = pd.to_datetime(x["Date"], utc=True, errors="coerce")
+    if x["Date"].isna().any():
+        raise AssertionError("raw data contains unparseable timestamps")
+    if not x["Date"].is_monotonic_increasing:
+        raise AssertionError("raw timestamps are not strictly chronological")
+    if x["Date"].duplicated().any():
+        raise AssertionError("raw data contains duplicate timestamps")
+    numeric = ["Open", "High", "Low", "Close", "Volume"]
+    if not np.isfinite(x[numeric].to_numpy(dtype=float)).all():
+        raise AssertionError("raw data contains NaN/Inf OHLCV")
+    if (x[["Open", "High", "Low", "Close"]] <= 0).any().any() or (x["Volume"] < 0).any():
+        raise AssertionError("raw data contains non-positive prices or negative volume")
+    if (x["High"] < x[["Open", "Close"]].max(axis=1)).any():
+        raise AssertionError("raw High is below Open/Close")
+    if (x["Low"] > x[["Open", "Close"]].min(axis=1)).any():
+        raise AssertionError("raw Low is above Open/Close")
+    if cfg.interval == "1h":
+        gaps = x["Date"].diff().dropna()
+        if (gaps != pd.Timedelta(hours=1)).any():
+            raise AssertionError("irregular hourly raw stream; repair data before research")
+
 def add_executable_label(d: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     d = d.sort_values("Date").reset_index(drop=True).copy()
     # Signal is formed at t. The first executable price is Open[t+1].
@@ -105,14 +133,13 @@ def simulate_executable(d: pd.DataFrame, cfg: Config, threshold: float) -> dict:
 
 def main() -> None:
     cfg = Config()
-    features_path = OUT / "features.csv"
     raw_path = OUT / "binance_btcusdt_history.csv"
-    if features_path.exists():
-        d = pd.read_csv(features_path, parse_dates=["Date"])
-    elif raw_path.exists():
-        d = make_features(pd.read_csv(raw_path, parse_dates=["Date"]), cfg)
-    else:
-        raise FileNotFoundError("No local BTC feature/history file available")
+    if not raw_path.exists():
+        raise FileNotFoundError("Canonical research input missing: binance_btcusdt_history.csv")
+    raw = pd.read_csv(raw_path, parse_dates=["Date"])
+    raw["Date"] = pd.to_datetime(raw["Date"], utc=True, errors="coerce")
+    validate_raw_ohlcv(raw, cfg)
+    d = make_features(raw, cfg)
     d["Date"] = pd.to_datetime(d["Date"], utc=True)
     d = add_executable_label(d, cfg)
     validate_event_time(d, cfg)
@@ -136,6 +163,8 @@ def main() -> None:
         "purge_rule": "training label_end_time < test decision_time",
         "regularity_rule": "exact 1h timestamps; irregular bars fail closed",
         "rows": int(len(d)),
+        "input": str(raw_path),
+        "raw_rows": int(len(raw)),
         "oos_start": str(d.Date.iloc[0]),
         "oos_end": str(d.Date.iloc[-1]),
         "config": asdict(cfg),
